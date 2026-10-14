@@ -15,7 +15,7 @@ export DEBIAN_FRONTEND=noninteractive
 log "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'nenhuma')"
 
 log "Instalando dependências"
-apt-get -qq update >/dev/null
+apt-get -qq update >/dev/null 2>&1 || true
 apt-get -qq install -y zstd pciutils lshw curl >/dev/null
 
 # ---------------------------------------------------------------- Tailscale
@@ -87,7 +87,11 @@ for m in "${MODEL_LIST[@]}"; do
   m=$(echo "$m" | xargs)
   [[ -z "$m" ]] && continue
   log "Baixando $m"
-  ollama pull "$m" 2>&1 | grep -vE '^(pulling|verifying|writing)' | tr '\r' '\n' | grep -v '^\s*$' | tail -n 2 || true
+  if ! ollama pull "$m" >/var/log/ollama-pull.log 2>&1; then
+    log "Falha ao baixar $m:"
+    tail -n 3 /var/log/ollama-pull.log | tr '\r' '\n' | tail -n 2
+    exit 1
+  fi
 done
 ollama list
 

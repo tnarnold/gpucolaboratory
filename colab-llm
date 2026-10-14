@@ -63,7 +63,11 @@ if p.wait():
 EOF
 }
 
-session_alive() { "$COLAB" status -s "$SESSION" >/dev/null 2>&1; }
+session_alive() { # `colab status` sai com 0 mesmo quando a sessão não existe
+  local out
+  out=$("$COLAB" status -s "$SESSION" 2>&1) || return 1
+  ! grep -qiE "not found|no active session" <<<"$out"
+}
 
 find_peer() { # imprime "ip dnsname" do peer online com o hostname dado
   tailscale status --json 2>/dev/null | python3 -c '
@@ -134,8 +138,8 @@ cmd_up() {
   } >"$envfile"
 
   info "Enviando scripts para a VM"
-  "$COLAB" upload -s "$SESSION" "$ROOT/remote/setup.sh" /content/colab-llm-setup.sh >/dev/null
-  "$COLAB" upload -s "$SESSION" "$envfile" /content/colab-llm.env >/dev/null
+  "$COLAB" upload -s "$SESSION" "$ROOT/remote/setup.sh" /content/colab-llm-setup.sh
+  "$COLAB" upload -s "$SESSION" "$envfile" /content/colab-llm.env
   rm -f "$envfile"
 
   info "Configurando a VM (Tailscale + Ollama + modelos: $MODELS)"
