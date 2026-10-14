@@ -2,3 +2,5 @@ config.env
 *.key
 ts_authkey
 .ipynb_checkpoints/
+__pycache__/
+*.pyc
