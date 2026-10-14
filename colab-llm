@@ -263,6 +263,17 @@ cmd_opencode() { # colab-llm opencode [--models a,b] [--default MODELO] [--url U
   python3 "$ROOT/scripts/opencode_config.py" --base-url "$url" --context "$OLLAMA_CONTEXT_LENGTH" "${extra[@]}"
 }
 
+cmd_pull() {
+  [[ -n ${1:-} ]] || die "uso: colab-llm pull MODELO"
+  info "Baixando $1 na VM"
+  remote "OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull ${1@Q} >/var/log/ollama-pull.log 2>&1 && echo ok || { tail -n 3 /var/log/ollama-pull.log; exit 1; }" 3600 | tee /dev/stderr | grep -qx ok ||
+    die "falha ao baixar $1"
+  if [[ "$OPENCODE" != 0 ]] && command -v opencode >/dev/null; then
+    info "Atualizando o opencode"
+    cmd_opencode
+  fi
+}
+
 cmd_keepalive() {
   local minutes=${1:-10}
   info "Ping no kernel a cada $minutes min (Ctrl-C para parar)"
@@ -277,7 +288,7 @@ case ${1:-} in
   up) shift; cmd_up "$@" ;;
   down | stop) cmd_down ;;
   status) cmd_status ;;
-  pull) [[ -n ${2:-} ]] || die "uso: colab-llm pull MODELO"; remote "source /etc/colab-llm-ollama.env; OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull ${2@Q} 2>&1 | tail -n 1" 3600 ;;
+  pull) shift; cmd_pull "$@" ;;
   logs) remote "tail -n ${2:-50} /var/log/ollama.log" ;;
   shell) "$COLAB" console -s "$SESSION" ;;
   keepalive) shift; cmd_keepalive "$@" ;;
