@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# colab-llm: sobe LLMs (Ollama) numa GPU do Google Colab e expõe a API na sua tailnet.
+# Requer: Colab CLI (`colab`), tailscale e python3 na máquina local.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+CONFIG=${COLAB_LLM_CONFIG:-$ROOT/config.env}
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+SESSION=${SESSION:-colab-llm}
+GPU=${GPU:-T4}
+HIGH_MEM=${HIGH_MEM:-0}
+MODELS=${MODELS:-qwen2.5:7b}
+TS_HOSTNAME=${TS_HOSTNAME:-colab-gpu}
+TS_TAGS=${TS_TAGS:-}
+TS_AUTHKEY_FILE=${TS_AUTHKEY_FILE:-$HOME/.config/colab-llm/ts_authkey}
+OLLAMA_PORT=${OLLAMA_PORT:-11434}
+OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-32768}
+SETUP_TIMEOUT=${SETUP_TIMEOUT:-3600}
+COLAB=${COLAB:-colab}
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[31merro:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Uso: colab-llm <comando> [opções]
+
+Comandos:
+  up        Cria a VM com GPU, conecta na tailnet, sobe o Ollama e baixa os modelos
+  down      Desliga a VM (o nó efêmero sai da tailnet sozinho)
+  status    Mostra a sessão no Colab e testa a API pela tailnet
+  pull M    Baixa mais um modelo na VM em execução
+  logs      Últimas linhas do log do Ollama na VM
+  shell     Abre um console na VM
+  keepalive [min]  Faz um ping no kernel a cada N minutos (padrão 10)
+  opencode  Adiciona o provider "colab" no opencode [--default MODELO] [--models a,b]
+
+Opções do 'up' (sobrescrevem config.env):
+  --gpu T4|L4|G4|A100|H100   --high-mem   --models a,b,c
+  --hostname NOME            --session NOME
+
+Config: $CONFIG
+EOF
+}
+
+need() { command -v "$1" >/dev/null || die "'$1' não encontrado. $2"; }
+
+remote() { # executa um comando shell na VM e mostra a saída
+  local cmd timeout=${2:-120}
+  cmd=$(python3 -c 'import sys; print(repr(sys.argv[1]))' "$1")
+  "$COLAB" exec -s "$SESSION" --timeout "$timeout" <<EOF
+import subprocess
+p = subprocess.Popen(["bash", "-lc", $cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+for line in p.stdout:
+    print(line, end="", flush=True)
+if p.wait():
+    raise RuntimeError(f"comando remoto saiu com código {p.returncode}")
+EOF
+}
+
+session_alive() { "$COLAB" status -s "$SESSION" >/dev/null 2>&1; }
+
+find_peer() { # imprime "ip dnsname" do peer online com o hostname dado
+  tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+host = sys.argv[1]
+d = json.load(sys.stdin)
+for p in (d.get("Peer") or {}).values():
+    if p.get("Online") and (p.get("HostName") == host or p.get("DNSName", "").startswith(host + ".")):
+        print(p["TailscaleIPs"][0], p["DNSName"].rstrip("."))
+        break
+' "$1"
+}
+
+wait_api() {
+  local host=$1
+  for _ in $(seq 60); do
+    curl -fsS --max-time 5 "http://$host:$OLLAMA_PORT/api/version" >/dev/null 2>&1 && return 0
+    sleep 5
+  done
+  return 1
+}
+
+cmd_up() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --gpu) GPU=$2; shift 2 ;;
+      --high-mem) HIGH_MEM=1; shift ;;
+      --models) MODELS=$2; shift 2 ;;
+      --hostname) TS_HOSTNAME=$2; shift 2 ;;
+      --session) SESSION=$2; shift 2 ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+  done
+
+  need "$COLAB" "Instale com: uv tool install google-colab-cli"
+  need tailscale "Esta máquina precisa estar na mesma tailnet."
+  need python3 ""
+  need curl ""
+
+  info "Verificando login no Colab (na primeira vez abre um link de autorização)"
+  "$COLAB" sessions >/dev/null
+
+  if session_alive; then
+    info "Sessão '$SESSION' já existe, reaproveitando"
+  else
+    info "Criando VM no Colab: GPU=$GPU sessão=$SESSION"
+    local args=(new -s "$SESSION" --gpu "$GPU")
+    [[ "$HIGH_MEM" == 1 ]] && args+=(--high-mem)
+    "$COLAB" "${args[@]}"
+  fi
+
+  local authkey=${TS_AUTHKEY:-}
+  if [[ -z "$authkey" && -f "$TS_AUTHKEY_FILE" ]]; then
+    authkey=$(tr -d '[:space:]' <"$TS_AUTHKEY_FILE")
+  fi
+  [[ -z "$authkey" ]] && info "Sem auth key do Tailscale: vou te mostrar um link de login"
+
+  envfile=$(mktemp)
+  chmod 600 "$envfile"
+  trap 'rm -f "$envfile"' EXIT
+  {
+    printf 'TS_HOSTNAME=%q\n' "$TS_HOSTNAME"
+    printf 'TS_TAGS=%q\n' "$TS_TAGS"
+    printf 'TS_AUTHKEY=%q\n' "$authkey"
+    printf 'MODELS=%q\n' "$MODELS"
+    printf 'OLLAMA_PORT=%q\n' "$OLLAMA_PORT"
+    printf 'OLLAMA_CONTEXT_LENGTH=%q\n' "$OLLAMA_CONTEXT_LENGTH"
+  } >"$envfile"
+
+  info "Enviando scripts para a VM"
+  "$COLAB" upload -s "$SESSION" "$ROOT/remote/setup.sh" /content/colab-llm-setup.sh >/dev/null
+  "$COLAB" upload -s "$SESSION" "$envfile" /content/colab-llm.env >/dev/null
+  rm -f "$envfile"
+
+  info "Configurando a VM (Tailscale + Ollama + modelos: $MODELS)"
+  local out
+  out=$(mktemp)
+  remote "bash /content/colab-llm-setup.sh /content/colab-llm.env" "$SETUP_TIMEOUT" | while IFS= read -r line; do
+    echo "$line" >>"$out"
+    case $line in
+      COLAB_LLM_TS_LOGIN_URL=*)
+        echo
+        bold "Abra para autorizar a VM na sua tailnet:"
+        bold "  ${line#COLAB_LLM_TS_LOGIN_URL=}"
+        echo
+        ;;
+      COLAB_LLM_*) ;;
+      *) echo "  $line" ;;
+    esac
+  done
+
+  local dns
+  dns=$(sed -n 's/^COLAB_LLM_TS_DNS=//p' "$out")
+  rm -f "$out"
+
+  info "Procurando '$TS_HOSTNAME' na tailnet"
+  local peer="" ip=""
+  for _ in $(seq 30); do
+    peer=$(find_peer "${dns%%.*}" || true)
+    [[ -z "$peer" ]] && peer=$(find_peer "$TS_HOSTNAME" || true)
+    [[ -n "$peer" ]] && break
+    sleep 2
+  done
+  [[ -z "$peer" ]] && die "VM não apareceu na tailnet. Veja: colab-llm status"
+  read -r ip dns <<<"$peer"
+
+  info "Testando a API em http://$ip:$OLLAMA_PORT"
+  wait_api "$ip" || die "API não respondeu pela tailnet"
+
+  echo
+  bold "Pronto! API na tailnet:"
+  echo "  OpenAI-compat : http://$dns:$OLLAMA_PORT/v1"
+  echo "  Ollama        : http://$dns:$OLLAMA_PORT   (OLLAMA_HOST=http://$dns:$OLLAMA_PORT)"
+  echo "  IP            : $ip"
+  echo "  Modelos       : $MODELS"
+  echo
+  echo "Desligar: $(basename "$0") down"
+}
+
+cmd_down() {
+  info "Desligando a sessão '$SESSION'"
+  "$COLAB" stop -s "$SESSION"
+}
+
+cmd_status() {
+  "$COLAB" status -s "$SESSION" || true
+  local peer
+  peer=$(find_peer "$TS_HOSTNAME" || true)
+  if [[ -z "$peer" ]]; then
+    echo "Tailnet: '$TS_HOSTNAME' offline"
+    return
+  fi
+  read -r ip dns <<<"$peer"
+  echo "Tailnet: $dns ($ip)"
+  curl -fsS --max-time 5 "http://$ip:$OLLAMA_PORT/api/ps" | python3 -c '
+import json, sys
+models = json.load(sys.stdin).get("models", [])
+print("Carregados na GPU:", ", ".join(m["name"] for m in models) or "nenhum")
+' || echo "API: sem resposta"
+}
+
+cmd_opencode() { # colab-llm opencode [--models a,b] [--default MODELO] [--url URL]
+  local url="" extra=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --url) url=$2; shift 2 ;;
+      --models | --default | --config) extra+=("$1" "$2"); shift 2 ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+  done
+  if [[ -z "$url" ]]; then
+    local peer ip dns suffix
+    peer=$(find_peer "$TS_HOSTNAME" || true)
+    if [[ -n "$peer" ]]; then
+      read -r ip dns <<<"$peer"
+    else
+      # VM desligada: usa o nome MagicDNS esperado e os modelos do config
+      suffix=$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["MagicDNSSuffix"])')
+      dns="$TS_HOSTNAME.$suffix"
+      [[ " ${extra[*]} " == *" --models "* ]] || extra+=(--models "$MODELS")
+      info "'$TS_HOSTNAME' offline; configurando para $dns com MODELS=$MODELS"
+    fi
+    url="http://$dns:$OLLAMA_PORT/v1"
+  fi
+  python3 "$ROOT/scripts/opencode_config.py" --base-url "$url" --context "$OLLAMA_CONTEXT_LENGTH" "${extra[@]}"
+}
+
+cmd_keepalive() {
+  local minutes=${1:-10}
+  info "Ping no kernel a cada $minutes min (Ctrl-C para parar)"
+  while session_alive; do
+    "$COLAB" exec -s "$SESSION" <<<'print("keepalive")' >/dev/null || true
+    sleep $((minutes * 60))
+  done
+  echo "Sessão '$SESSION' terminou."
+}
+
+case ${1:-} in
+  up) shift; cmd_up "$@" ;;
+  down | stop) cmd_down ;;
+  status) cmd_status ;;
+  pull) [[ -n ${2:-} ]] || die "uso: colab-llm pull MODELO"; remote "source /etc/colab-llm-ollama.env; OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull ${2@Q} 2>&1 | tail -n 1" 3600 ;;
+  logs) remote "tail -n ${2:-50} /var/log/ollama.log" ;;
+  shell) "$COLAB" console -s "$SESSION" ;;
+  keepalive) shift; cmd_keepalive "$@" ;;
+  opencode) shift; cmd_opencode "$@" ;;
+  -h | --help | help | "") usage ;;
+  *) usage; exit 1 ;;
+esac
