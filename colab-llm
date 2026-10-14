@@ -160,6 +160,17 @@ cmd_up() {
     esac
   done
 
+  # `colab exec` sai com 0 mesmo quando o código remoto falha: confere o marcador do setup
+  if ! grep -q '^\[setup\] Pronto' "$out"; then
+    if grep -qi 'invalid key' "$out"; then
+      echo
+      bold "A auth key do Tailscale foi recusada (expirou, foi revogada ou não é Reusable)."
+      echo "  Gere outra em https://login.tailscale.com/admin/settings/keys com Reusable + Ephemeral + Pre-approved"
+      echo "  e salve em $TS_AUTHKEY_FILE. Depois rode '$(basename "$0") up' de novo (a VM é reaproveitada)."
+    fi
+    rm -f "$out"
+    die "setup na VM falhou. A VM continua ligada: '$(basename "$0") up' tenta de novo, '$(basename "$0") down' desliga."
+  fi
   local dns
   dns=$(sed -n 's/^COLAB_LLM_TS_DNS=//p' "$out")
   rm -f "$out"
