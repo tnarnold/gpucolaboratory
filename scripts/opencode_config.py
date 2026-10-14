@@ -6,7 +6,9 @@ Preserva os outros providers, faz backup do arquivo e aceita .json ou .jsonc
 
 Uso:
   opencode_config.py --base-url http://colab-gpu.x.ts.net:11434/v1 [--models a,b] [--context 32768] [--default MODEL]
+  opencode_config.py --remove
 Sem --models, lista os modelos direto da API (/api/tags).
+--remove tira o provider e, se o modelo padrão era do Colab, restaura o anterior.
 """
 import argparse
 import json
@@ -63,17 +65,70 @@ def find_config() -> Path:
 def api_models(base_url: str) -> list[str]:
     root = base_url.rstrip("/").removesuffix("/v1")
     with urllib.request.urlopen(f"{root}/api/tags", timeout=10) as r:
-        return [m["name"] for m in json.load(r).get("models", [])]
+        # modelos de embedding não servem para chat
+        return [m["name"] for m in json.load(r).get("models", []) if "embed" not in m["name"]]
+
+
+def load(path: Path) -> dict:
+    if not path.exists():
+        return {"$schema": "https://opencode.ai/config.json"}
+    raw = path.read_text()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(strip_jsonc(raw))
+
+
+def save(path: Path, cfg: dict) -> None:
+    if path.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup, n = path.with_name(f"{path.name}.bak-{stamp}"), 1
+        while backup.exists():
+            backup, n = path.with_name(f"{path.name}.bak-{stamp}-{n}"), n + 1
+        shutil.copy2(path, backup)
+        print(f"backup: {backup}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def remove(path: Path, prev_model_file: Path) -> int:
+    cfg = load(path)
+    changed = cfg.get("provider", {}).pop(PROVIDER_ID, None) is not None
+    if str(cfg.get("model", "")).startswith(f"{PROVIDER_ID}/"):
+        prev = prev_model_file.read_text().strip() if prev_model_file.exists() else ""
+        if prev:
+            cfg["model"] = prev
+            print(f"modelo padrão restaurado: {prev}")
+        else:
+            del cfg["model"]
+        changed = True
+    prev_model_file.unlink(missing_ok=True)
+    if not changed:
+        print(f"opencode: provider '{PROVIDER_ID}' não estava configurado")
+        return 0
+    save(path, cfg)
+    print(f"opencode: provider '{PROVIDER_ID}' removido de {path}")
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", required=True)
+    ap.add_argument("--base-url", default="")
     ap.add_argument("--models", default="")
     ap.add_argument("--context", type=int, default=32768)
     ap.add_argument("--default", dest="default_model", default="")
     ap.add_argument("--config", default="")
+    ap.add_argument("--remove", action="store_true")
     a = ap.parse_args()
+
+    path = Path(a.config) if a.config else find_config()
+    prev_model_file = path.with_name(f".{PROVIDER_ID}-prev-model")
+    if a.remove:
+        return remove(path, prev_model_file)
+    if not a.base_url:
+        ap.error("--base-url é obrigatório (ou use --remove)")
 
     models = [m.strip() for m in a.models.split(",") if m.strip()]
     if not models:
@@ -86,17 +141,8 @@ def main() -> int:
         print("erro: nenhum modelo encontrado", file=sys.stderr)
         return 1
 
-    path = Path(a.config) if a.config else find_config()
-    cfg = {"$schema": "https://opencode.ai/config.json"}
-    if path.exists():
-        raw = path.read_text()
-        try:
-            cfg = json.loads(raw)
-        except json.JSONDecodeError:
-            cfg = json.loads(strip_jsonc(raw))
-        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(path, backup)
-        print(f"backup: {backup}")
+    cfg = load(path)
+    original = json.dumps(cfg, sort_keys=True)
 
     providers = cfg.setdefault("provider", {})
     prev = providers.get(PROVIDER_ID, {})
@@ -116,12 +162,15 @@ def main() -> int:
         },
     }
     if a.default_model:
+        current = str(cfg.get("model", ""))
+        if current and not current.startswith(f"{PROVIDER_ID}/"):
+            prev_model_file.write_text(current + "\n")  # restaurado no --remove
         cfg["model"] = f"{PROVIDER_ID}/{a.default_model}"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    if json.dumps(cfg, sort_keys=True) == original:
+        print(f"opencode: provider '{PROVIDER_ID}' já atualizado ({a.base_url})")
+        return 0
+    save(path, cfg)
 
     print(f"opencode: provider '{PROVIDER_ID}' -> {a.base_url} em {path}")
     for m in models:

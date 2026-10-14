@@ -100,7 +100,9 @@ Funciona com Open WebUI, Continue, aider, LiteLLM e qualquer cliente OpenAI: `ba
 ./colab-llm opencode --default qwen3:30b-a3b   # e define como modelo padrão
 ```
 
-O comando adiciona o provider `colab` ao `~/.config/opencode/opencode.json(c)` e mantém os outros providers. Antes de alterar, faz um backup `.bak-<data>`. Depois, no opencode, escolha o modelo com `/models` → `colab/...`.
+**Isso é automático:** se o `opencode` estiver instalado, o `up` já roda esse passo no final e o `down` remove o provider (se você usou `--default`, o modelo padrão anterior volta). O opencode passa a enxergar os modelos que estão de fato na VM, com o hostname real (ex.: `colab-gpu-1`). Para desligar, use `OPENCODE=0` no `config.env`.
+
+O comando adiciona o provider `colab` ao `~/.config/opencode/opencode.json(c)` e mantém os outros providers. Ele só grava quando algo mudou, e antes faz um backup `.bak-<data>`. Modelos de embedding ficam de fora. Depois, no opencode, escolha o modelo com `/models` → `colab/...`.
 
 Se a VM estiver ligada, ele lista os modelos pela API. Se estiver desligada, usa os `MODELS` do config.
 
