@@ -71,8 +71,7 @@ No primeiro comando, o Colab CLI mostra um link do Google. Abra, autorize e cole
 ./colab-llm pull llama3.1:8b                     # baixa mais um modelo
 ./colab-llm logs                                 # log do Ollama
 ./colab-llm shell                                # console na VM
-./colab-llm keepalive 10                         # ping no kernel a cada 10 min (opcional)
-./colab-llm down                                 # desliga a VM e para de gastar unidades
+./colab-llm down                                 # desliga a VM, o keepalive e tira o modelo do opencode
 ```
 
 ### Consumindo a API
@@ -134,9 +133,20 @@ Valores com a quantização padrão do Ollama (Q4):
   - sobe o `ollama serve` com watchdog e baixa os modelos.
 - Depois, a máquina local espera o nó aparecer na tailnet e testa `/api/version` antes de dizer "pronto".
 
+### Manter a VM ativa
+
+O Colab desliga VMs cujo **kernel** fica ocioso, mesmo que a API esteja sendo usada: as chamadas ao Ollama pela tailnet não passam pelo kernel. Por isso o `up` deixa um **keepalive em segundo plano**, que executa algo no kernel a cada 5 minutos (`KEEPALIVE_MIN`). Não precisa deixar navegador nem terminal abertos.
+
+- O `down` encerra o keepalive. **Lembre de rodar `down`**: com o keepalive, a VM só para quando você manda ou quando bate o limite de tempo do Colab.
+- Se a VM cair sozinha, o keepalive tira o modelo do opencode e mostra uma notificação no desktop.
+- `./colab-llm status` mostra se o keepalive está rodando. O log fica em `~/.local/state/colab-llm/`.
+- Use `KEEPALIVE_MIN=0` para desativar.
+
+Acompanhe o consumo com `colab usage`, que mostra o saldo e as unidades por hora.
+
 ## Limitações e avisos
 
-- **Tempo de sessão:** o Colab encerra VMs ociosas e tem limite de duração (maior no Pro/Pro+). Quando cair, rode `up` de novo. Os modelos são baixados outra vez.
+- **Tempo de sessão:** mesmo com o keepalive, o Colab tem um limite de duração por sessão (maior no Pro/Pro+). Quando cair, rode `up` de novo. Os modelos são baixados outra vez.
 - **Custo:** GPU no Pro consome *compute units*. Rode `down` quando terminar. Veja o saldo com `colab usage`.
 - **Termos do Colab:** o Google restringe alguns usos, principalmente no plano gratuito (ex.: proxies, uso não interativo). Expor uma API por túnel pode ser enquadrado nisso. Leia o [FAQ do Colab](https://research.google.com/colaboratory/faq.html) e use por sua conta e risco.
 - **Sem autenticação na API:** quem estiver na tailnet consegue usar. Restrinja com ACL (exemplo acima).

@@ -21,6 +21,10 @@ OLLAMA_PORT=${OLLAMA_PORT:-11434}
 OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-32768}
 SETUP_TIMEOUT=${SETUP_TIMEOUT:-3600}
 OPENCODE=${OPENCODE:-auto} # auto: atualiza o provider "colab" no opencode ao final do up, se o opencode existir
+# O Colab desliga VMs com o kernel ocioso (as chamadas à API do Ollama não contam).
+# O up deixa um keepalive em segundo plano executando algo no kernel a cada N minutos; 0 desliga.
+KEEPALIVE_MIN=${KEEPALIVE_MIN:-5}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/colab-llm
 COLAB=${COLAB:-colab}
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -38,7 +42,7 @@ Comandos:
   pull M    Baixa mais um modelo na VM em execução
   logs      Últimas linhas do log do Ollama na VM
   shell     Abre um console na VM
-  keepalive [min]  Faz um ping no kernel a cada N minutos (padrão 10)
+  keepalive [min]  Mantém a VM ativa em primeiro plano (o up já inicia um em segundo plano)
   opencode  Adiciona o provider "colab" no opencode [--default MODELO] [--models a,b] [--remove]
 
 Opções do 'up' (sobrescrevem config.env):
@@ -201,10 +205,43 @@ cmd_up() {
     cmd_opencode --url "http://$dns:$OLLAMA_PORT/v1" || echo "  (falhou; rode: $(basename "$0") opencode)"
     echo
   fi
+  start_keepalive
   echo "Desligar: $(basename "$0") down"
 }
 
+keepalive_pid() { # imprime o PID do keepalive em segundo plano, se estiver vivo
+  local f="$STATE_DIR/keepalive-$SESSION.pid" pid
+  [[ -f "$f" ]] || return 1
+  pid=$(<"$f")
+  kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+start_keepalive() {
+  [[ "$KEEPALIVE_MIN" == 0 ]] && return
+  if keepalive_pid >/dev/null; then
+    info "Keepalive já está rodando"
+    return
+  fi
+  mkdir -p "$STATE_DIR"
+  local runner=nohup
+  command -v setsid >/dev/null && runner="setsid nohup"
+  $runner "$ROOT/colab-llm" keepalive "$KEEPALIVE_MIN" --background \
+    >>"$STATE_DIR/keepalive-$SESSION.log" 2>&1 </dev/null &
+  echo $! >"$STATE_DIR/keepalive-$SESSION.pid"
+  info "Keepalive em segundo plano a cada $KEEPALIVE_MIN min (log: $STATE_DIR/keepalive-$SESSION.log)"
+}
+
+stop_keepalive() {
+  local pid
+  if pid=$(keepalive_pid); then
+    kill "$pid" 2>/dev/null || true
+    info "Keepalive encerrado"
+  fi
+  rm -f "$STATE_DIR/keepalive-$SESSION.pid"
+}
+
 cmd_down() {
+  stop_keepalive
   info "Desligando a sessão '$SESSION'"
   "$COLAB" stop -s "$SESSION"
   if [[ "$OPENCODE" != 0 ]] && command -v opencode >/dev/null; then
@@ -215,6 +252,12 @@ cmd_down() {
 
 cmd_status() {
   "$COLAB" status -s "$SESSION" || true
+  local kpid
+  if kpid=$(keepalive_pid); then
+    echo "Keepalive: rodando (PID $kpid, a cada $KEEPALIVE_MIN min)"
+  else
+    echo "Keepalive: parado"
+  fi
   local peer
   peer=$(find_peer "$TS_HOSTNAME" || true)
   if [[ -z "$peer" ]]; then
@@ -274,14 +317,36 @@ cmd_pull() {
   fi
 }
 
+notify() { # notificação no desktop, se houver como
+  if command -v notify-send >/dev/null; then
+    notify-send "colab-llm" "$1" 2>/dev/null || true
+  elif command -v osascript >/dev/null; then
+    osascript -e "display notification \"$1\" with title \"colab-llm\"" 2>/dev/null || true
+  fi
+}
+
 cmd_keepalive() {
-  local minutes=${1:-10}
-  info "Ping no kernel a cada $minutes min (Ctrl-C para parar)"
+  local minutes=${1:-$KEEPALIVE_MIN} background=0
+  [[ ${2:-} == --background ]] && background=1
+  [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || die "uso: colab-llm keepalive MINUTOS"
+  [[ "$background" == 0 ]] && info "Executando algo no kernel a cada $minutes min (Ctrl-C para parar)"
   while session_alive; do
-    "$COLAB" exec -s "$SESSION" <<<'print("keepalive")' >/dev/null || true
+    if "$COLAB" exec -s "$SESSION" <<<'print("keepalive")' >/dev/null 2>&1; then
+      echo "$(date '+%F %T') ok"
+    else
+      echo "$(date '+%F %T') falha no exec"
+    fi
     sleep $((minutes * 60))
   done
-  echo "Sessão '$SESSION' terminou."
+  echo "$(date '+%F %T') sessão '$SESSION' terminou"
+  if [[ "$background" == 1 ]]; then
+    # caiu sem `down` (limite de tempo do Colab, falta de unidades...): limpa o opencode e avisa
+    rm -f "$STATE_DIR/keepalive-$SESSION.pid"
+    if [[ "$OPENCODE" != 0 ]] && command -v opencode >/dev/null; then
+      python3 "$ROOT/scripts/opencode_config.py" --remove || true
+    fi
+    notify "A VM do Colab ('$SESSION') foi desligada."
+  fi
 }
 
 case ${1:-} in
